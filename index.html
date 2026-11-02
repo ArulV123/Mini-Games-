@@ -195,10 +195,68 @@ const esc=s=>String(s).replace(/[&<>"']/g,c=>'&#'+c.charCodeAt(0)+';');
 const shuf=a=>{for(let i=a.length-1;i>0;i--){const j=rnd(i+1);[a[i],a[j]]=[a[j],a[i]]}return a};
 const SS=sessionStorage;let tok=SS.tok||(SS.tok=Math.random().toString(36).slice(2)+Date.now().toString(36));
 let name=SS.nm||'',code='',peer,hc,isHost=false,R=null,HS=null,me=0,lastMsg=0,lostT=0,C={},outSeq=0;
+let peerRun=0,joinAttempts=0,joinRetryTimer=0;
 const seenChat=new Set();
-const ICE={iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},
-{urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
-{urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}]};
+
+/*
+  ICE configuration for players on different networks.
+  OpenRelay's current static-auth endpoint is used by default. The optional
+  Metered URL can be filled with app-specific TURN credentials for production.
+*/
+const METERED_TURN_CREDENTIALS_URL = '';
+const ICE={
+  iceServers:[
+    {urls:'stun:stun.l.google.com:19302'},
+    {urls:'stun:stun1.l.google.com:19302'},
+    {urls:'stun:openrelay.metered.ca:80'}
+  ],
+  iceCandidatePoolSize:10,
+  sdpSemantics:'unified-plan'
+};
+async function openRelayStaticIceServers(){
+  if(!globalThis.crypto?.subtle)throw new Error('Web Crypto is unavailable; use HTTPS to enable TURN authentication.');
+  // OpenRelay publishes this shared static-auth secret in its documentation.
+  // TURN REST credentials are short-lived: expiry timestamp + HMAC-SHA1 password.
+  const username=(Math.floor(Date.now()/1000)+3600)+':playspace';
+  const secret=new TextEncoder().encode('openrelayprojectsecret');
+  const key=await crypto.subtle.importKey('raw',secret,{name:'HMAC',hash:'SHA-1'},false,['sign']);
+  const digest=await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(username));
+  let binary='';for(const b of new Uint8Array(digest))binary+=String.fromCharCode(b);
+  const credential=btoa(binary);
+  return [
+    {urls:'turn:staticauth.openrelay.metered.ca:80',username,credential},
+    {urls:'turn:staticauth.openrelay.metered.ca:80?transport=tcp',username,credential},
+    {urls:'turn:staticauth.openrelay.metered.ca:443',username,credential},
+    {urls:'turn:staticauth.openrelay.metered.ca:443?transport=tcp',username,credential},
+    {urls:'turns:staticauth.openrelay.metered.ca:443',username,credential}
+  ];
+}
+async function makePeerOptions(){
+  let iceServers=[...ICE.iceServers],turnReady=false;
+  if(METERED_TURN_CREDENTIALS_URL.trim()){
+    try{
+      const response=await fetch(METERED_TURN_CREDENTIALS_URL,{cache:'no-store'});
+      if(!response.ok)throw new Error('TURN credential request returned HTTP '+response.status);
+      const relayServers=await response.json();
+      if(!Array.isArray(relayServers)||!relayServers.length)throw new Error('TURN server list was empty');
+      iceServers=[...iceServers.filter(x=>String(x.urls).startsWith('stun:')),...relayServers];
+      turnReady=true;
+    }catch(e){console.warn('Could not load Metered TURN credentials; trying OpenRelay static auth.',e)}
+  }
+  if(!turnReady){
+    try{iceServers.push(...await openRelayStaticIceServers())}
+    catch(e){
+      console.warn('OpenRelay static TURN credentials unavailable; using legacy relay fallback.',e);
+      iceServers.push(
+        {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
+        {urls:'turn:openrelay.metered.ca:80?transport=tcp',username:'openrelayproject',credential:'openrelayproject'},
+        {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'},
+        {urls:'turns:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'}
+      );
+    }
+  }
+  return {config:{iceServers,iceCandidatePoolSize:ICE.iceCandidatePoolSize,sdpSemantics:ICE.sdpSemantics},debug:1};
+}
 const pn=i=>esc(R&&R.pl[i]?R.pl[i].n:'?'),st=h=>{$('#st').innerHTML=h};
 
 /* ================= NETWORK (host = authority, star topology) ================= */
@@ -221,14 +279,40 @@ function home(msg){app.k='';R=null;document.body.classList.remove('inroom');chat
  <div class="home-game-card"><span>🎲</span><b>Ludo</b><small>Race your pieces home</small></div><div class="home-game-card"><span>♟️</span><b>Chess</b><small>Think a few moves ahead</small></div><div class="home-game-card"><span>🃏</span><b>UNO</b><small>Match, play and reverse</small></div><div class="home-game-card"><span>🎯</span><b>Carrom</b><small>Line up the perfect shot</small></div><div class="home-game-card"><span>⭕</span><b>Tic Tac Toe</b><small>A quick classic rematch</small></div>
 </div></section><footer class="home-footer">MADE FOR FRIENDS <span>✦</span> PLAY TOGETHER</footer></main>`}
 function getName(){name=($('#nm').value.replace(/[<>"&']/g,'').trim()||'Player'+rnd(100));SS.nm=name}
-function create(){getName();isHost=true;code=Array.from({length:4},()=>'ABCDEFGHJKLMNPQRSTUVWXYZ'[rnd(24)]).join('');
-CH=[];seenChat.clear();unread=0;HS={players:[{tok,name,on:1,last:Date.now(),lastSeq:0}],sel:'ttt',game:null,s:null,n:0,gid:0,rev:0,chat:CH,chatSeq:0};
-peer=new Peer('mgw-'+code,{config:ICE});
-peer.on('open',bcast);peer.on('connection',hconn);
-const fix=()=>setTimeout(()=>{try{peer.reconnect()}catch(e){}},1500);
-peer.on('disconnected',fix);
-peer.on('error',e=>{if(e.type=='unavailable-id'){peer.destroy();create()}else if(['network','server-error','socket-error','socket-closed'].includes(e.type))fix()});
-bcast()}
+function create(){
+  getName();
+  const run=++peerRun;
+  clearTimeout(joinRetryTimer);clearTimeout(lostT);joinAttempts=0;
+  try{if(peer&&!peer.destroyed)peer.destroy()}catch(e){}
+  isHost=true;code=Array.from({length:4},()=>'ABCDEFGHJKLMNPQRSTUVWXYZ'[rnd(24)]).join('');
+  CH=[];seenChat.clear();unread=0;
+  HS={players:[{tok,name,on:1,last:Date.now(),lastSeq:0}],sel:'ttt',game:null,s:null,n:0,gid:0,rev:0,chat:CH,chatSeq:0};
+  const createButton=$('.home-create'),status=$('.home-error');
+  if(createButton)createButton.disabled=true;
+  if(status)status.textContent='Connecting to the room server…';
+  (async()=>{
+    const options=await makePeerOptions();
+    if(run!==peerRun||!isHost||!HS)return;
+    const p=peer=new Peer('mgw-'+code,options);
+    let opened=false;
+    const openWatch=setTimeout(()=>{
+      if(peer===p&&!opened){try{p.destroy()}catch(e){}peer=null;HS=null;isHost=false;home('Could not reach the multiplayer server. Check your internet connection and try again.')}
+    },20000);
+    p.on('open',()=>{if(peer!==p)return;opened=true;clearTimeout(openWatch);bcast()});
+    p.on('connection',hconn);
+    p.on('disconnected',()=>setTimeout(()=>{if(peer===p&&!p.destroyed){try{p.reconnect()}catch(e){}}},1500));
+    p.on('error',e=>{
+      if(peer!==p)return;
+      console.warn('Host PeerJS error:',e);
+      if(e.type==='unavailable-id'){
+        clearTimeout(openWatch);try{p.destroy()}catch(err){}
+        create();
+      }else if(['network','server-error','socket-error','socket-closed'].includes(e.type)&&!opened){
+        // The open watchdog will show a useful error rather than exposing an unusable room code.
+      }
+    });
+  })().catch(e=>{console.error(e);if(run===peerRun){HS=null;isHost=false;home('Unable to initialise multiplayer. Please reload and try again.')}});
+}
 function hconn(c){c.on('data',m=>hmsg(c,m));const f=()=>{const p=HS&&HS.players.find(p=>p.conn===c);if(p&&p.on){p.on=0;bcast()}};c.on('close',f);c.on('error',f)}
 function hmsg(c,m){const P=HS.players;let i=P.findIndex(p=>p.conn===c);
 if(m.t=='h'){i=P.findIndex(p=>p.tok==m.tok);
@@ -250,20 +334,74 @@ function tolobby(){HS.game=null;HS.s=null;bcast()}
 function pick(k){HS.sel=k;bcast()}
 function send(a){if(isHost)hAct(0,a);else if(hc&&hc.open)hc.send({t:'a',seq:++outSeq,a})}
 /* client */
-function join(){getName();code=$('#cd').value.trim().toUpperCase();if(code.length!=4)return home('Enter the 4-letter room code');isHost=false;mkpeer();$('#cd').disabled=1}
-function mkpeer(){peer=new Peer({config:ICE});
-peer.on('open',()=>{if(!(hc&&hc.open))cth()});
-peer.on('disconnected',()=>setTimeout(()=>{try{peer.reconnect()}catch(e){}},1000));
-peer.on('error',e=>{if(e.type=='peer-unavailable'){if(!R){leave();home('Room not found')}else lost()}else if(e.type!='webrtc')lost()})}
-function cth(){if(hc)try{hc.close()}catch(e){}
-const c=hc=peer.connect('mgw-'+code,{reliable:true});
-c.on('open',()=>{lastMsg=Date.now();outSeq=0;c.send({t:'h',tok,name})});
-c.on('data',m=>{lastMsg=Date.now();if(m.t=='r')onRoom(m);else if(m.t=='c')gotChat(m.m);else if(m.t=='ch'){CH=(m.l||[]).slice(-60);seenChat.clear();CH.forEach(x=>{if(x&&x.id!=null)seenChat.add(x.id)});unread=0;chatUI()}else if(m.t=='x'){leave();home(m.m)}});
-c.on('close',()=>{if(hc===c)lost()});c.on('error',()=>{if(hc===c)lost()})}
+function join(){
+  getName();code=$('#cd').value.trim().toUpperCase();
+  if(code.length!=4)return home('Enter the 4-letter room code');
+  isHost=false;joinAttempts=0;
+  const joinButton=$('.home-join-row button'),status=$('.home-error');
+  if(joinButton)joinButton.disabled=true;
+  if(status)status.textContent='Connecting to room '+code+'…';
+  const run=++peerRun;mkpeer(run);
+}
+async function mkpeer(run=++peerRun){
+  const options=await makePeerOptions();
+  if(run!==peerRun||isHost||!code)return;
+  const p=peer=new Peer(options);
+  p.on('open',()=>{if(peer===p&&!(hc&&hc.open))cth()});
+  p.on('disconnected',()=>setTimeout(()=>{if(peer===p&&!p.destroyed){try{p.reconnect()}catch(e){}}},1000));
+  p.on('error',e=>{
+    if(peer!==p)return;
+    console.warn('Client PeerJS error:',e);
+    if(e.type==='peer-unavailable'){
+      if(!R)retryJoin('Room is not responding yet. Checking the room code…');
+      else lost();
+    }else if(['network','server-error','socket-error','socket-closed','webrtc'].includes(e.type)){
+      if(R)lost();else retryJoin('Network connection is being retried…');
+    }
+  });
+}
+function retryJoin(message){
+  if(isHost||R||!peer||peer.destroyed)return;
+  clearTimeout(joinRetryTimer);
+  if(joinAttempts>=3){
+    const p=peer;peer=hc=null;peerRun++;try{p.destroy()}catch(e){}
+    joinAttempts=0;home('Could not connect to that room. Confirm the host is online, check the four-letter code, and try again.');
+    return;
+  }
+  joinAttempts++;
+  const status=$('.home-error');if(status)status.textContent=message+' Retry '+joinAttempts+'/3…';
+  joinRetryTimer=setTimeout(()=>{if(peer&&!peer.destroyed&&!R)cth()},1200*joinAttempts);
+}
+function cth(){
+  if(!peer||peer.destroyed||peer.disconnected||isHost)return;
+  if(hc)try{hc.close()}catch(e){}
+  const c=hc=peer.connect('mgw-'+code,{reliable:true,serialization:'json'});
+  let handshakeWatch=0;
+  const openWatch=setTimeout(()=>{if(hc===c&&!R&&!c.open)retryJoin('The device connection is taking longer than expected.');},15000);
+  c.on('open',()=>{
+    clearTimeout(openWatch);joinAttempts=0;clearTimeout(joinRetryTimer);
+    const status=$('.home-error');if(status)status.textContent='Connected to the room server. Waiting for the host…';
+    lastMsg=Date.now();outSeq=0;c.send({t:'h',tok,name});
+    handshakeWatch=setTimeout(()=>{if(hc===c&&!R)retryJoin('The host has not responded yet.');},12000);
+  });
+  c.on('data',m=>{
+    lastMsg=Date.now();
+    if(m.t=='r'){clearTimeout(handshakeWatch);onRoom(m)}
+    else if(m.t=='c')gotChat(m.m);
+    else if(m.t=='ch'){CH=(m.l||[]).slice(-60);seenChat.clear();CH.forEach(x=>{if(x&&x.id!=null)seenChat.add(x.id)});unread=0;chatUI()}
+    else if(m.t=='x'){clearTimeout(handshakeWatch);const p=peer;peer=hc=null;peerRun++;try{p&&p.destroy()}catch(e){}isHost=false;home(m.m)}
+  });
+  c.on('close',()=>{clearTimeout(openWatch);clearTimeout(handshakeWatch);if(hc===c){if(R)lost();else retryJoin('The room connection closed. Reconnecting…')}});
+  c.on('error',e=>{clearTimeout(openWatch);clearTimeout(handshakeWatch);if(hc===c){console.warn('Data connection error:',e);if(R)lost();else retryJoin('Could not establish the device connection. Retrying…')}});
+}
 function lost(){if(isHost||!peer||lostT)return;const b=$('#bn');if(b)b.textContent='⚠ Reconnecting…';
-lostT=setTimeout(()=>{lostT=0;if(isHost||!peer)return;if(peer.destroyed)mkpeer();else if(peer.disconnected){try{peer.reconnect()}catch(e){}setTimeout(cth,900)}else cth()},1500)}
-function leave(){try{if(hc&&hc.open)hc.send({t:'b'})}catch(e){}const p=peer;setTimeout(()=>{try{p&&p.destroy()}catch(e){}},200);
-peer=hc=HS=R=null;isHost=false;clearTimeout(lostT);lostT=0;home()}
+lostT=setTimeout(()=>{lostT=0;if(isHost||!peer)return;if(peer.destroyed)mkpeer();else if(peer.disconnected){try{peer.reconnect()}catch(e){mkpeer()}}else cth()},1500)}
+function leave(){
+  ++peerRun;clearTimeout(joinRetryTimer);clearTimeout(lostT);joinRetryTimer=lostT=0;joinAttempts=0;
+  try{if(hc&&hc.open)hc.send({t:'b'})}catch(e){}
+  const p=peer;setTimeout(()=>{try{p&&p.destroy()}catch(e){}},200);
+  peer=hc=HS=R=null;isHost=false;home()
+}
 setInterval(()=>{const now=Date.now();
 if(HS)HS.players.forEach((p,i)=>{if(!i)return;if(p.conn&&p.conn.open)try{p.conn.send({t:'q'})}catch(e){}if(p.on&&now-p.last>9000){p.on=0;bcast()}});
 else if(hc&&R){if(hc.open)try{hc.send({t:'p'})}catch(e){}if(now-lastMsg>9000){try{hc.close()}catch(e){}lost()}}},2000);
