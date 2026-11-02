@@ -313,17 +313,60 @@ function create(){
     });
   })().catch(e=>{console.error(e);if(run===peerRun){HS=null;isHost=false;home('Unable to initialise multiplayer. Please reload and try again.')}});
 }
-function hconn(c){c.on('data',m=>hmsg(c,m));const f=()=>{const p=HS&&HS.players.find(p=>p.conn===c);if(p&&p.on){p.on=0;bcast()}};c.on('close',f);c.on('error',f)}
-function hmsg(c,m){const P=HS.players;let i=P.findIndex(p=>p.conn===c);
-if(m.t=='h'){i=P.findIndex(p=>p.tok==m.tok);
-if(i<0){if(HS.game){c.send({t:'x',m:'Game already in progress'});return setTimeout(()=>c.close(),300)}
-if(P.length>=3){c.send({t:'x',m:'Room is full (max 3 players)'});return setTimeout(()=>c.close(),300)}
-P.push({tok:m.tok,name:String(m.name).slice(0,12),lastSeq:0});i=P.length-1}
-const p=P[i];if(p.conn&&p.conn!==c)try{p.conn.close()}catch(e){}
-p.conn=c;p.on=1;p.lastSeq=0;p.name=String(m.name).slice(0,12);p.last=Date.now();bcast();try{c.send({t:'ch',l:HS.chat})}catch(e){}return}
-if(i<0)return;const p=P[i];p.last=Date.now();
-if(!p.on){p.on=1;bcast()}
-if(m.t=='m')hchat(i,m.x);else if(m.t=='a'){const q=Number(m.seq);if(Number.isSafeInteger(q)&&q>p.lastSeq){p.lastSeq=q;hAct(i,m.a)}}else if(m.t=='b'){if(!HS.game)P.splice(i,1);else p.on=0;bcast()}}
+function hconn(c){
+ c.on('data',m=>{if(HS)hmsg(c,m)});
+ const onGone=()=>{
+  if(!HS)return;
+  const i=HS.players.findIndex(p=>p&&p.conn===c);
+  if(i<=0)return; // Ignore the host and stale connection callbacks.
+  const p=HS.players[i];
+  if(HS.game){
+   // During a match keep the seat stable so the same player can reconnect.
+   if(p.on){p.on=0;bcast()}
+  }else{
+   // In the lobby, immediately free abandoned seats for the next friend.
+   HS.players.splice(i,1);bcast();
+  }
+ };
+ c.on('close',onGone);c.on('error',onGone);
+}
+function hmsg(c,m){
+ if(!HS||!m)return;
+ const P=HS.players;let i=P.findIndex(p=>p&&p.conn===c);
+ if(m.t==='h'){
+  const clientToken=String(m.tok||'').slice(0,100);
+  if(!clientToken){try{c.send({t:'x',m:'This device could not be identified. Refresh the page and try again.'})}catch(e){}return setTimeout(()=>{try{c.close()}catch(e){}},300)}
+  i=P.findIndex(p=>p&&String(p.tok)===clientToken);
+  if(i<0&&!HS.game){
+   // Remove abandoned lobby records before checking the three-player limit.
+   for(let j=P.length-1;j>=1;j--){
+    const old=P[j];
+    if(!old||!old.conn||!old.conn.open||!old.on)P.splice(j,1);
+   }
+  }
+  if(i<0){
+   // A late arrival may watch an active match; their seat is spectator-only
+   // until the next lobby/rematch. The live game seat count (HS.n) is not changed.
+   if(P.length>=3){try{c.send({t:'x',m:'Room is full (maximum 3 connected players). Ask someone to leave, then try again.'})}catch(e){}return setTimeout(()=>{try{c.close()}catch(e){}},300)}
+   P.push({tok:clientToken,name:String(m.name||'Player').slice(0,12),lastSeq:0});i=P.length-1;
+  }
+  const p=P[i];
+  if(p.conn&&p.conn!==c)try{p.conn.close()}catch(e){}
+  p.conn=c;p.on=1;p.lastSeq=0;p.name=String(m.name||p.name||'Player').slice(0,12);p.last=Date.now();
+  bcast();try{c.send({t:'ch',l:HS.chat})}catch(e){}return;
+ }
+ if(i<0)return;
+ const p=P[i];p.last=Date.now();
+ if(!p.on){p.on=1;bcast()}
+ if(m.t==='m')hchat(i,m.x);
+ else if(m.t==='a'){
+  const q=Number(m.seq);
+  if(Number.isSafeInteger(q)&&q>p.lastSeq){p.lastSeq=q;hAct(i,m.a)}
+ }else if(m.t==='b'){
+  if(!HS.game){P.splice(i,1);bcast()}
+  else{p.on=0;bcast()}
+ }
+}
 function bcast(){if(!HS)return;const P=HS.players,g=HS.game,
 base={t:'r',rev:++HS.rev,pl:P.map((p,i)=>({n:p.name,on:i?!!p.on:true})),sel:HS.sel,g,gid:HS.gid,n:HS.n};
 P.forEach((p,i)=>{const m={...base,me:i,v:g?(GM[g].view||(s=>s))(HS.s,i):0};
@@ -952,10 +995,14 @@ window.addEventListener('orientationchange',()=>{if(R&&R.g==='carrom'){const cv=
    The original game UI and authoritative game engine remain unchanged.
    Host registers a stable room code in the first available PeerJS slot.
    Joining clients scan the same slots and retry when signaling drops.
+   Lobby disconnects free seats; late joiners can enter as spectators.
 */
 (function installMeetStyleMultiplayer(){
   let roomGen=1,searchGen=1,roomScanTimer=0,peerReconnectTimer=0,peerReconnectStep=0;
   let scanToken=0,scanFail=null,hostReady=false;
+  // Keep old Peer objects alive when their signaling ID is lost: PeerJS can
+  // preserve their already-open data channels while the host registers a new ID.
+  let retiredPeers=[];
   const MAX_ROOM_SLOTS=25;
   const roomPeerId=slot=>'mgw-'+code+(slot>1?'-'+slot:'');
   function netStatus(message){
@@ -983,8 +1030,9 @@ window.addEventListener('orientationchange',()=>{if(R&&R.g==='carrom'){const cv=
   function startHostPeer(run,options,slot=1,attempt=0){
     if(run!==peerRun||!isHost||!HS)return;
     if(slot>MAX_ROOM_SLOTS){
-      peer=null;HS=null;isHost=false;hostReady=false;
-      home('Could not reserve a room connection. Please create a new room and try again.');return;
+      hostReady=false;
+      netStatus('The room has reached its address-recovery limit. Create a new room to let new players join.');
+      return;
     }
     roomGen=slot;hostReady=false;
     let p;
@@ -992,39 +1040,55 @@ window.addEventListener('orientationchange',()=>{if(R&&R.g==='carrom'){const cv=
     catch(e){
       console.error('Could not create host Peer:',e);
       if(attempt<2){setTimeout(()=>startHostPeer(run,options,slot,attempt+1),1200*(attempt+1));return}
-      HS=null;isHost=false;home('Could not start the multiplayer connection. Please try again.');return;
+      netStatus('Could not start the multiplayer connection. Please try again.');return;
     }
-    let opened=false;
+    let opened=false,handedOff=false;
     const openWatch=setTimeout(()=>{
       if(peer!==p||opened||run!==peerRun)return;
       try{p.destroy()}catch(e){}
       if(peer===p)peer=null;
       if(attempt<2){netStatus('Signaling server is slow. Retrying room setup…');setTimeout(()=>startHostPeer(run,options,slot,attempt+1),1400*(attempt+1));}
-      else{HS=null;isHost=false;hostReady=false;home('Could not reach the multiplayer server. Check your connection and try again.')}
-    },18000);
+      else{hostReady=false;netStatus('Could not reach the multiplayer server. Check your connection and try again.');}
+    },20000);
+    const moveRoomAddress=(reason)=>{
+      if(handedOff||peer!==p||run!==peerRun||!isHost||!HS)return;
+      handedOff=true;clearTimeout(openWatch);clearTimeout(peerReconnectTimer);
+      peerReconnectTimer=0;peerReconnectStep=0;hostReady=false;
+      const nextSlot=Math.max(slot,roomGen)+1;
+      // Do NOT destroy an already-open Peer here: its existing DataConnections
+      // may still carry the active match. The new Peer accepts future joiners.
+      if(opened)retiredPeers.push(p);
+      else{try{p.destroy()}catch(e){}}
+      peer=null;
+      netStatus(reason||'Refreshing the room address so new players can join…');
+      setTimeout(()=>{if(run===peerRun&&isHost&&HS)startHostPeer(run,options,nextSlot,0)},450);
+    };
     p.on('open',()=>{
       if(peer!==p||run!==peerRun||!isHost)return;
       opened=true;hostReady=true;peerReconnectStep=0;clearTimeout(openWatch);clearTimeout(peerReconnectTimer);peerReconnectTimer=0;
-      netStatus('Room is online. Share code '+code+' with your friends.');
+      netStatus('Room is online (address '+slot+'). Share code '+code+' with your friends.');
       bcast();
     });
     p.on('connection',c=>{if(peer===p&&run===peerRun)hconn(c)});
     p.on('disconnected',()=>{if(peer===p&&run===peerRun)keepPeerAlive(p,run)});
     p.on('close',()=>{
       clearTimeout(openWatch);
-      if(peer!==p||run!==peerRun||!isHost||!HS)return;
+      if(peer!==p||run!==peerRun||!isHost||!HS||handedOff)return;
       peer=null;hostReady=false;
       clearTimeout(peerReconnectTimer);peerReconnectTimer=0;
-      setNetStatus('Room connection closed. Restoring the room…');
+      netStatus('Room signaling closed. Re-registering the room…');
       setTimeout(()=>{if(run===peerRun&&isHost&&HS)startHostPeer(run,options,roomGen,0)},1200);
     });
     p.on('error',e=>{
-      if(peer!==p||run!==peerRun)return;
+      if(peer!==p||run!==peerRun||handedOff)return;
       console.warn('Host PeerJS error:',e);
-      if(e.type==='unavailable-id'&&!opened){
-        clearTimeout(openWatch);peer=null;try{p.destroy()}catch(err){}
-        netStatus('Room address is already in use. Trying another address…');
-        setTimeout(()=>startHostPeer(run,options,slot+1,0),250);
+      if(e.type==='unavailable-id'){
+        // This also happens AFTER a successful open when reconnect() discovers
+        // that the old signaling ID has been claimed. Previously it was ignored,
+        // leaving current players connected but making all future joins impossible.
+        moveRoomAddress(opened
+          ?'Refreshing the room address. Current players will stay in the match…'
+          :'Room address is already in use. Trying another address…');
       }else if(['network','server-error','socket-error','socket-closed'].includes(e.type)){
         if(!opened)netStatus('Connecting to the multiplayer service…');
         if(p.disconnected)keepPeerAlive(p,run);
@@ -1084,15 +1148,24 @@ window.addEventListener('orientationchange',()=>{if(R&&R.g==='carrom'){const cv=
       if(peer!==p||run!==peerRun)return;
       console.warn('Client PeerJS error:',e);
       if(e.type==='peer-unavailable'){
-        if(scanFail)scanFail('Room host not found at this address. Checking the next one…');
-        else if(!R)scanRoom(searchGen+1);else lost();
-      }else if(['network','server-error','socket-error','socket-closed','webrtc'].includes(e.type)){
+        // PeerJS includes the unavailable destination in its error message.
+        // Match it to the live scan so a delayed error from slot N cannot
+        // accidentally cancel the valid connection attempt for slot N+1.
+        const match=/Could not connect to peer\s+(.+?)\s*$/i.exec(String(e.message||''));
+        const unavailableId=match?match[1].trim().replace(/[.,]$/,''):'';
+        if(scanFail&&(!unavailableId||unavailableId===scanFail.peerId))scanFail('Room host not found at '+(scanFail.peerId||'this address')+'. Checking the next one…');
+        else if(!scanFail&&!roomScanTimer&&!R)scanRoom(searchGen+1);
+        else if(R)lost();
+      }else if(['network','server-error','socket-error','socket-closed'].includes(e.type)){
         if(R)lost();
         else{
           netStatus('Network connection interrupted. Reconnecting…');
           if(p.disconnected)keepPeerAlive(p,run);
-          else{clearTimeout(roomScanTimer);roomScanTimer=setTimeout(()=>scanRoom(searchGen||1),1600)}
+          else if(!scanFail&&!roomScanTimer)roomScanTimer=setTimeout(()=>scanRoom(searchGen||1),1600);
         }
+      }else if(e.type==='webrtc'){
+        if(R)lost();
+        else if(scanFail)scanFail('The room address responded, but WebRTC is retrying this same address…',searchGen,1800);
       }else if(['browser-incompatible','invalid-id','invalid-key','ssl-unavailable'].includes(e.type)){
         rejectRoom('This browser or page cannot establish WebRTC. Open the game over HTTPS in a current browser.');
       }
@@ -1112,22 +1185,26 @@ window.addEventListener('orientationchange',()=>{if(R&&R.g==='carrom'){const cv=
     try{c=hc=p.connect(roomPeerId(slot),{reliable:true,serialization:'json'})}
     catch(e){console.warn('Room connection attempt failed:',e);hc=null;roomScanTimer=setTimeout(()=>scanRoom(slot+1),350);return}
     let opened=false,welcomed=false,failed=false,openWatch=0,handshakeWatch=0;
-    const fail=(message)=>{
+    const fail=(message,nextSlot=slot+1,delay=350)=>{
       if(failed||ticket!==scanToken||peer!==p||run!==peerRun||hc!==c||welcomed)return;
       failed=true;clearTimeout(openWatch);clearTimeout(handshakeWatch);
       if(scanFail===fail)scanFail=null;hc=null;
       try{c.close()}catch(e){}
       netStatus(message||'Checking the next room address…');
-      roomScanTimer=setTimeout(()=>scanRoom(slot+1),350);
+      roomScanTimer=setTimeout(()=>scanRoom(nextSlot),delay);
     };
+    fail.peerId=roomPeerId(slot);fail.slot=slot;fail.ticket=ticket;
     scanFail=fail;
-    openWatch=setTimeout(()=>{if(!opened)fail('Room address did not respond. Checking the next one…')},7500);
+    // A real host can take longer than a few seconds to finish ICE/TURN
+    // negotiation, especially on mobile or restrictive Wi-Fi. Do not skip its
+    // address after the previous 7.5-second timeout.
+    openWatch=setTimeout(()=>{if(!opened)fail('Room address is taking longer to connect. Retrying this address…',slot,1800)},22000);
     c.on('open',()=>{
       if(ticket!==scanToken||peer!==p||run!==peerRun||hc!==c)return;
       opened=true;clearTimeout(openWatch);netStatus('Connected to room address. Verifying room…');
       lastMsg=Date.now();outSeq=0;
       try{c.send({t:'h',tok,name})}catch(e){fail('Could not send the room handshake. Retrying…');return}
-      handshakeWatch=setTimeout(()=>{if(!welcomed)fail('No room response yet. Checking another room address…')},8000);
+      handshakeWatch=setTimeout(()=>{if(!welcomed)fail('Host connection opened, but the room handshake is delayed. Retrying this address…',slot,1800)},15000);
     });
     c.on('data',m=>{
       if(ticket!==scanToken||peer!==p||run!==peerRun||hc!==c||!m)return;
@@ -1148,13 +1225,15 @@ window.addEventListener('orientationchange',()=>{if(R&&R.g==='carrom'){const cv=
     c.on('close',()=>{
       clearTimeout(openWatch);clearTimeout(handshakeWatch);
       if(ticket!==scanToken||peer!==p||run!==peerRun||hc!==c)return;
-      if(scanFail===fail)scanFail=null;hc=null;
-      if(welcomed||R)lost();else fail('Room connection closed. Checking the next address…');
+      if(welcomed||R){if(scanFail===fail)scanFail=null;hc=null;lost()}
+      else if(opened)fail('Connection to this room address dropped. Retrying the same address…',slot,1400);
+      else fail('Room address did not accept the connection. Checking the next one…');
     });
     c.on('error',e=>{
       if(ticket!==scanToken||peer!==p||run!==peerRun||hc!==c)return;
       console.warn('Room data connection error:',e);
-      if(welcomed||R)lost();else fail('WebRTC connection failed. Checking the next address…');
+      if(welcomed||R){if(scanFail===fail)scanFail=null;hc=null;lost()}
+      else fail('WebRTC negotiation failed. Retrying this room address…',slot,1800);
     });
   }
   function lost(){
@@ -1171,8 +1250,8 @@ window.addEventListener('orientationchange',()=>{if(R&&R.g==='carrom'){const cv=
   function leave(){
     ++peerRun;clearNetworkTimers();scanToken++;scanFail=null;joinAttempts=0;peerReconnectStep=0;hostReady=false;
     try{if(hc&&hc.open)hc.send({t:'b'})}catch(e){}
-    const old=peer;peer=hc=HS=R=null;isHost=false;
-    setTimeout(()=>{try{old&&old.destroy()}catch(e){}},200);
+    const oldPeers=[peer,...retiredPeers].filter(Boolean);retiredPeers=[];peer=hc=HS=R=null;isHost=false;
+    setTimeout(()=>{oldPeers.forEach(old=>{try{old.destroy()}catch(e){}})},200);
     home();
   }
   window.create=create;window.join=join;window.lost=lost;window.leave=leave;
